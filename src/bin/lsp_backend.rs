@@ -1186,13 +1186,13 @@ impl ServerApp {
         println!("[Init] Setting network to: {:?}", network);
         builder.set_network(network);
 
-        // println!("[Init] Setting Esplora API URL: {}", DEFAULT_CHAIN_SOURCE_URL);
-        // builder.set_chain_source_esplora(DEFAULT_CHAIN_SOURCE_URL.to_string(), None);
+        println!("[Init] Setting Esplora API URL: {}", DEFAULT_CHAIN_URL);
+        builder.set_chain_source_esplora(DEFAULT_CHAIN_URL.to_string(), None);
 
         let rpc_user = std::env::var("BITCOIND_RPC_USER").unwrap_or_default();
         let rpc_pass = std::env::var("BITCOIND_RPC_PASS").unwrap_or_default();
-        println!("[Init] Setting Bitcoin RPC connection");
-        builder.set_chain_source_bitcoind_rpc("127.0.0.1".into(), 8332, rpc_user, rpc_pass);
+        // println!("[Init] Setting Bitcoin RPC connection");
+        // builder.set_chain_source_bitcoind_rpc("127.0.0.1".into(), 8332, rpc_user, rpc_pass);
 
         println!("[Init] Setting storage directory: {}", data_dir);
         builder.set_storage_dir_path(data_dir.to_string());

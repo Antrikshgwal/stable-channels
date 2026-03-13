@@ -1604,20 +1604,20 @@ impl UserApp {
     }
 
     // TODO - for onchain deposits ...
-    // fn get_lsps1_channel(&mut self) {
-    //     let lsp_balance_sat = 10_000;
-    //     let client_balance_sat = 10_000;
-    //     let lsps1 = self.node.lsps1_liquidity();
-    //     match lsps1.request_channel(lsp_balance_sat, client_balance_sat, 2016, false) {
-    //         Ok(status) => {
-    //             self.status_message =
-    //                 format!("LSPS1 channel order initiated! Status: {status:?}");
-    //         }
-    //         Err(e) => {
-    //             self.status_message = format!("LSPS1 channel request failed: {e:?}");
-    //         }
-    //     }
-    // }
+    fn get_lsps1_channel(&mut self) {
+        let lsp_balance_sat = 10_000;
+        let client_balance_sat = 10_000;
+        let lsps1 = self.node.lsps1_liquidity();
+        match lsps1.request_channel(lsp_balance_sat, client_balance_sat, 2016, false) {
+            Ok(status) => {
+                self.status_message =
+                    format!("LSPS1 channel order initiated! Status: {status:?}");
+            }
+            Err(e) => {
+                self.status_message = format!("LSPS1 channel request failed: {e:?}");
+            }
+        }
+    }
 
     /// Send a trade message to the LSP with the new stabilized USD amount.
     /// The fee is sent as the keysend payment amount.
