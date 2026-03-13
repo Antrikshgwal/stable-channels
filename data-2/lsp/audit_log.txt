@@ -1,0 +1,6 @@
+{"data":{"btc_price":73568.3},"event":"PRICE_FETCH","ts":"2026-04-10T20:07:38.778982904+00:00"}
+{"data":{"btc_price":73570.565},"event":"PRICE_FETCH","ts":"2026-04-10T20:12:07.701564137+00:00"}
+{"data":{"btc_price":73453.0},"event":"PRICE_FETCH","ts":"2026-04-11T20:23:37.223290412+00:00"}
+{"data":{"btc_price":73459.0},"event":"PRICE_FETCH","ts":"2026-04-11T20:29:18.069061134+00:00"}
+{"data":{"btc_price":73464.175},"event":"PRICE_FETCH","ts":"2026-04-11T20:51:37.266490929+00:00"}
+{"data":{"btc_price":73339.94},"event":"PRICE_FETCH","ts":"2026-04-11T20:57:37.928699396+00:00"}
