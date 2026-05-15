@@ -9,7 +9,6 @@ import SQLite3
 /// - `lsp_to_user`: LSP owes user sats (price dropped). Start node, wait for incoming payment.
 /// - `user_to_lsp`: User owes LSP sats (price rose). Start node, calculate amount, send keysend.
 class NotificationService: UNNotificationServiceExtension {
-
     private static let appGroup = "group.com.stablechannels.app"
     private static let lspPubkey = "0388948c5c7775a5eda3ee4a96434a270f20f5beeed7e9c99f242f21b87d658850"
     private static let lspAddress = "34.198.44.89:9735"
@@ -122,7 +121,7 @@ class NotificationService: UNNotificationServiceExtension {
         let seedPhrasePath = dataDir.appendingPathComponent("seed_phrase")
 
         guard FileManager.default.fileExists(atPath: keySeedPath.path)
-           || FileManager.default.fileExists(atPath: seedPhrasePath.path) else {
+            || FileManager.default.fileExists(atPath: seedPhrasePath.path) else {
             nseLog("FAILED: No seed (checked keys_seed and seed_phrase)")
             cleanup()
             contentHandler(content)
@@ -145,7 +144,8 @@ class NotificationService: UNNotificationServiceExtension {
 
             // If wallet uses mnemonic (seed_phrase), set it on the builder
             if FileManager.default.fileExists(atPath: seedPhrasePath.path),
-               let words = try? String(contentsOfFile: seedPhrasePath.path, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+               let words = try? String(contentsOfFile: seedPhrasePath.path, encoding: .utf8)
+               .trimmingCharacters(in: .whitespacesAndNewlines),
                !words.isEmpty {
                 nseLog("Using seed_phrase mnemonic")
                 builder.setEntropyBip39Mnemonic(mnemonic: words, passphrase: nil)
@@ -179,7 +179,9 @@ class NotificationService: UNNotificationServiceExtension {
             let ldkNode = try builder.build()
 
             let memAfterBuild = Self.residentMemoryBytes()
-            nseLog("DIAG: memory after build() = \(memAfterBuild / 1024)KB (delta +\((memAfterBuild - memUsage) / 1024)KB)")
+            nseLog(
+                "DIAG: memory after build() = \(memAfterBuild / 1024)KB (delta +\((memAfterBuild - memUsage) / 1024)KB)"
+            )
 
             try ldkNode.start()
             self.node = ldkNode
@@ -236,7 +238,7 @@ class NotificationService: UNNotificationServiceExtension {
         nseLog("lsp_to_user: Waiting for incoming payment")
 
         let startTime = Date()
-        let timeout: TimeInterval = 22  // Leave ~8s for cleanup + notification delivery
+        let timeout: TimeInterval = 22 // Leave ~8s for cleanup + notification delivery
         var received = false
         var amountMsatTotal: UInt64 = 0
         var paymentIdStr: String?
@@ -317,7 +319,7 @@ class NotificationService: UNNotificationServiceExtension {
                     nseLog("Payment received: \(amountMsat / 1000) sats")
                     try? node.eventHandled()
                     received = true
-                    // Keep polling — there might be more payments
+                // Keep polling — there might be more payments
                 default:
                     try? node.eventHandled()
                 }
@@ -368,6 +370,21 @@ class NotificationService: UNNotificationServiceExtension {
     ) {
         nseLog("user_to_lsp: Calculating stability payment")
 
+        // Cooldown: skip if we sent a stability payment recently
+        let shared = UserDefaults(suiteName: Self.appGroup)
+        shared?.synchronize()
+        let lastSent = shared?.double(forKey: "nse_last_stability_sent") ?? 0
+        let secondsSinceLast = Date().timeIntervalSince1970 - lastSent
+        nseLog("Cooldown check: lastSent=\(lastSent), secondsSince=\(Int(secondsSinceLast))")
+        if lastSent > 0 && secondsSinceLast < 120 {
+            nseLog("Cooldown: \(Int(secondsSinceLast))s since last payment, skipping (120s required)")
+            content.title = "Stability Check"
+            content.body = "Position is stable"
+            cleanup()
+            contentHandler(content)
+            return
+        }
+
         // 1. Read channel state from SQLite
         let dbPath = dataDir.appendingPathComponent("stablechannels.db").path
         guard let channelState = readChannelState(dbPath: dbPath) else {
@@ -412,10 +429,14 @@ class NotificationService: UNNotificationServiceExtension {
         let dollarsFromPar = stableUSDValue - targetUSD
         let percentFromPar = targetUSD > 0 ? abs(dollarsFromPar / targetUSD) * 100.0 : 0.0
 
-        nseLog("Stability check: stableUSD=\(String(format: "%.2f", stableUSDValue)), target=\(String(format: "%.2f", targetUSD)), pct=\(String(format: "%.3f", percentFromPar))%")
+        nseLog(
+            "Stability check: stableUSD=\(String(format: "%.2f", stableUSDValue)), target=\(String(format: "%.2f", targetUSD)), pct=\(String(format: "%.3f", percentFromPar))%"
+        )
 
-        guard percentFromPar >= Self.stabilityThresholdPercent else {
-            nseLog("Within threshold, no payment needed")
+        guard percentFromPar >= Self.stabilityThresholdPercent && abs(dollarsFromPar) >= 0.25 else {
+            nseLog(
+                "Within threshold (pct=\(String(format: "%.3f", percentFromPar))%, drift=$\(String(format: "%.2f", abs(dollarsFromPar)))), no payment needed"
+            )
             content.title = "Stability Check"
             content.body = "Position is stable"
             cleanup()
@@ -441,7 +462,7 @@ class NotificationService: UNNotificationServiceExtension {
 
         // 5. Send keysend with stability TLV marker
         do {
-            let tlvRecord = CustomTlvRecord(typeNum: Self.stableChannelTLVType, value: [1])  // marker byte
+            let tlvRecord = CustomTlvRecord(typeNum: Self.stableChannelTLVType, value: [1]) // marker byte
             let paymentId = try node.spontaneousPayment().sendWithCustomTlvs(
                 amountMsat: amountMsat,
                 nodeId: Self.lspPubkey,
@@ -462,8 +483,15 @@ class NotificationService: UNNotificationServiceExtension {
                 btcPrice: price
             )
 
-            // Do NOT reset backingSats — keysend accepted but not confirmed delivered.
-            // Next stability check will detect remaining drift after cooldown.
+            // Reset backingSats to equilibrium — accounts payment against stable pool.
+            // Server does the same reset, so they stay in sync.
+            let newBacking = UInt64(targetUSD / price * Self.satsInBTC)
+            updateBackingSatsInDB(dbPath: dbPath, backingSats: newBacking)
+
+            let cooldownDefaults = UserDefaults(suiteName: Self.appGroup)
+            cooldownDefaults?.set(Date().timeIntervalSince1970, forKey: "nse_last_stability_sent")
+            cooldownDefaults?.synchronize()
+            nseLog("Cooldown: stamped at \(Date().timeIntervalSince1970)")
 
             content.title = "Stability Payment Sent"
             content.body = String(format: "Sent %d sats ($%.2f) to maintain stable position", amountSats, dollarsAbs)
@@ -546,14 +574,40 @@ class NotificationService: UNNotificationServiceExtension {
 
     private func updateBackingSatsInDB(dbPath: String, backingSats: UInt64) {
         var db: OpaquePointer?
-        guard sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else { return }
+        let rc = sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READWRITE, nil)
+        guard rc == SQLITE_OK else {
+            nseLog("updateBacking: open failed rc=\(rc)")
+            return
+        }
         defer { sqlite3_close(db) }
-        let sql = "UPDATE stable_channels SET backing_sats = ? WHERE id = (SELECT MAX(id) FROM stable_channels)"
+        /// Bump updated_at so the row we just wrote remains the deterministic
+        /// fallback for the next read (matches ORDER BY updated_at DESC, channel_id DESC).
+        let sql = """
+        UPDATE channels
+        SET stable_sats = ?,
+            updated_at = strftime('%s', 'now')
+        WHERE channel_id = (
+            SELECT channel_id
+            FROM channels
+            ORDER BY updated_at DESC, channel_id DESC
+            LIMIT 1
+        )
+        """
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        let prepRc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+        guard prepRc == SQLITE_OK else {
+            nseLog("updateBacking: prepare failed rc=\(prepRc)")
+            return
+        }
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_int64(stmt, 1, Int64(backingSats))
-        sqlite3_step(stmt)
+        let stepRc = sqlite3_step(stmt)
+        if stepRc == SQLITE_DONE {
+            let changes = sqlite3_changes(db)
+            nseLog("Updated backingSats to \(backingSats) (rows=\(changes))")
+        } else {
+            nseLog("updateBacking: step failed rc=\(stepRc)")
+        }
     }
 
     // MARK: - Lightweight SQLite Reader
@@ -681,7 +735,7 @@ class NotificationService: UNNotificationServiceExtension {
 
         guard !prices.isEmpty else { return 0 }
         let sorted = prices.sorted()
-        return sorted[sorted.count / 2]  // median
+        return sorted[sorted.count / 2] // median
     }
 
     // MARK: - Cleanup
@@ -720,7 +774,7 @@ class NotificationService: UNNotificationServiceExtension {
         let hasGraph: Bool
         if sqlite3_step(stmt) == SQLITE_ROW {
             let size = sqlite3_column_int64(stmt, 0)
-            hasGraph = size > 100_000  // Only strip if >100KB
+            hasGraph = size > 100_000 // Only strip if >100KB
         } else {
             hasGraph = false
         }

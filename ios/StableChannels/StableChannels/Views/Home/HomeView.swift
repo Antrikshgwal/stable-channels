@@ -57,7 +57,8 @@ struct HomeView: View {
 
                     // Price Chart
                     if appState.btcPrice > 0 {
-                        PriceChartView(compact: true)
+                        PriceChartCard(compact: true)
+                            .equatable()
                             .padding(.bottom, 8)
                     }
 
@@ -89,12 +90,12 @@ struct HomeView: View {
         }
         .onAppear {
             checkNotifications()
-            appState.ensureLSPConnected()
+            Task.detached { [appState] in appState.ensureLSPConnected() }
         }
         .onChange(of: scenePhase) {
             if scenePhase == .active {
                 checkNotifications()
-                appState.ensureLSPConnected()
+                Task.detached { [appState] in appState.ensureLSPConnected() }
             }
         }
         .sheet(isPresented: $showSendSheet) { SendView() }
@@ -312,7 +313,7 @@ struct HomeView: View {
     }
 
     private var hasReadyChannel: Bool {
-        appState.nodeService.channels.contains { $0.isChannelReady }
+        appState.hasReadyChannel
     }
 
     private var savingsSection: some View {
@@ -322,8 +323,8 @@ struct HomeView: View {
                     .font(.caption.bold())
                 Spacer()
                 Text(showBTC
-                     ? "\(appState.onchainBalanceSats.btcSpacedFormatted) BTC"
-                     : onchainUSD.usdFormatted)
+                    ? "\(appState.onchainBalanceSats.btcSpacedFormatted) BTC"
+                    : onchainUSD.usdFormatted)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -331,7 +332,7 @@ struct HomeView: View {
             if appState.isSweeping {
                 // 1. Splice-in in progress
                 pendingRow(text: "Swap pending...", txid: appState.spliceTxid)
-            } else if hasReadyChannel && appState.nodeService.spendableOnchainSats() > 0 {
+            } else if hasReadyChannel && appState.spendableOnchainSats > 0 {
                 // 2. Channel + confirmed funds — offer to sweep
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
@@ -354,7 +355,7 @@ struct HomeView: View {
                             .clipShape(Capsule())
                     }
                 }
-            } else if appState.nodeService.spendableOnchainSats() == 0 {
+            } else if appState.spendableOnchainSats == 0 {
                 // 3. Unconfirmed deposit (with or without channel)
                 pendingRow(text: "Deposit confirming...", txid: appState.fundingTxid)
                 if !hasReadyChannel {
@@ -399,15 +400,7 @@ struct HomeView: View {
     // MARK: - Action Buttons
 
     private var actionButtons: some View {
-        let noChannel = !hasReadyChannel && appState.totalBalanceSats == 0
-
         return VStack(spacing: 8) {
-            if noChannel {
-                Text("Receive BTC to get started")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-            }
-
             HStack(spacing: 8) {
                 ActionButton(title: "Send", icon: "arrow.up.circle.fill", color: .blue) {
                     showSendSheet = true
@@ -476,9 +469,8 @@ struct PulseOverlay: View {
 
     var body: some View {
         RoundedRectangle(cornerRadius: 12)
-            .fill(color.opacity(on ? 0.15 : 0.0))
-            .scaleEffect(on ? 1.04 : 1.0)
-            .animation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true), value: on)
+            .fill(color.opacity(on ? 0.25 : 0.0))
+            .animation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true), value: on)
             .onAppear { on = true }
             .allowsHitTesting(false)
     }

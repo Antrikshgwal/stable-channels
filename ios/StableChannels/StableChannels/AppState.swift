@@ -33,22 +33,33 @@ class AppState {
     var isChannelClosing: Bool = false
     var isOpeningChannel: Bool = false
     var isSyncing: Bool = false
+    var spendableOnchainSats: UInt64 = 0
 
     // Balance (derived) — initialized from cache for instant display
     var lightningBalanceSats: UInt64 = {
         let ud = UserDefaults(suiteName: Constants.appGroupIdentifier)
         return UInt64(bitPattern: Int64(ud?.integer(forKey: "cached_lightning_sats") ?? 0))
     }()
+
     var onchainBalanceSats: UInt64 = {
         let ud = UserDefaults(suiteName: Constants.appGroupIdentifier)
         return UInt64(bitPattern: Int64(ud?.integer(forKey: "cached_onchain_sats") ?? 0))
     }()
+
+    var hasReadyChannel: Bool = false
+
     var totalBalanceSats: UInt64 {
         if isChannelClosing { return onchainBalanceSats }
         if isOpeningChannel { return lightningBalanceSats > 0 ? lightningBalanceSats : onchainBalanceSats }
         if isSweeping { return lightningBalanceSats }
+        // If no open channels but both balances exist, lightning balance is
+        // pending-close claimable that overlaps with on-chain — avoid double-count.
+        if !hasReadyChannel && lightningBalanceSats > 0 && onchainBalanceSats > 0 {
+            return onchainBalanceSats
+        }
         return lightningBalanceSats + onchainBalanceSats
     }
+
     var onchainReceiveAddress: String?
 
     var totalBalanceUSD: Double {
@@ -67,12 +78,13 @@ class AppState {
 
     // Auto-sweep state
     private(set) var isSweeping = false
-    var spliceTxid: String? = nil
+    var spliceTxid: String?
     private var sweepOnchainStart: UInt64 = 0
     private var prevOnchainSats: UInt64 = {
         let ud = UserDefaults(suiteName: Constants.appGroupIdentifier)
         return UInt64(bitPattern: Int64(ud?.integer(forKey: "cached_onchain_sats") ?? 0))
     }()
+
     var fundingTxid: String? {
         didSet {
             UserDefaults(suiteName: Constants.appGroupIdentifier)?
@@ -154,7 +166,7 @@ class AppState {
                 try await nodeService.start(
                     network: .bitcoin,
                     esploraURL: chainURL,
-                    mnemonic: ""  // Uses existing seed from data dir
+                    mnemonic: "" // Uses existing seed from data dir
                 )
                 // Store node_id in shared UserDefaults for NSE and push registration
                 let nodeId = nodeService.nodeId
@@ -243,7 +255,7 @@ class AppState {
 
         AuditService.log("DATA_MIGRATED", data: [
             "from": oldDir.path,
-            "to": newDir.path,
+            "to": newDir.path
         ])
     }
 
@@ -255,9 +267,9 @@ class AppState {
         let shared = UserDefaults(suiteName: Constants.appGroupIdentifier)
         var waited = 0
         while shared?.bool(forKey: "nse_processing") == true {
-            try? await Task.sleep(nanoseconds: 1_000_000_000)  // 1 second
+            try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
             waited += 1
-            if waited >= 10 { break }  // timeout after 10 seconds
+            if waited >= 10 { break } // timeout after 10 seconds
         }
         if waited > 0 {
             AuditService.log("NSE_WAIT", data: ["seconds": "\(waited)"])
@@ -482,7 +494,7 @@ class AppState {
         }
 
         // Restore node_metrics (contains RGS timestamp — must match the graph)
-        if let metricsData = try? Data(contentsOf: metricsPath), metricsData.count > 0 {
+        if let metricsData = try? Data(contentsOf: metricsPath), !metricsData.isEmpty {
             let metricsUpsert = "INSERT OR REPLACE INTO ldk_node_data (primary_namespace, secondary_namespace, key, value) VALUES ('', '', 'node_metrics', ?)"
             var metricsStmt: OpaquePointer?
             if sqlite3_prepare_v2(db, metricsUpsert, -1, &metricsStmt, nil) == SQLITE_OK {
@@ -517,16 +529,16 @@ class AppState {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
             #if DEBUG
-            let apnsEnvironment = "sandbox"
+                let apnsEnvironment = "sandbox"
             #else
-            let apnsEnvironment = "production"
+                let apnsEnvironment = "production"
             #endif
 
             let body: [String: String] = [
                 "device_token": token,
                 "platform": "ios",
                 "node_id": nodeId,
-                "environment": apnsEnvironment,
+                "environment": apnsEnvironment
             ]
 
             guard let httpBody = try? JSONSerialization.data(withJSONObject: body) else { return }
@@ -545,23 +557,46 @@ class AppState {
 
     // MARK: - Pending Push Payment (app was killed)
 
-    /// Check if the NSE flagged a pending payment while the app was killed.
-    /// Reconnect to LSP so the pending stability payment can land.
+    /// Check if NSE flagged a pending payment while app was killed
+    /// Reconnect to LSP so pending stability payment can land
     private func processPendingPushPayment() async {
         let shared = UserDefaults(suiteName: Constants.appGroupIdentifier)
         guard shared?.bool(forKey: "pending_push_payment") == true else { return }
 
-        shared?.set(false, forKey: "pending_push_payment")
         print("[Push] Processing pending push payment from NSE flag")
 
         // Reconnect to LSP so pending payment can be received
-        try? nodeService.node?.connect(
-            nodeId: Constants.defaultLSPPubkey,
-            address: Constants.defaultLSPAddress,
-            persist: true
-        )
-        refreshBalances()
-        updateStableBalances()
+        do {
+            try nodeService.node?.connect(
+                nodeId: Constants.defaultLSPPubkey,
+                address: Constants.defaultLSPAddress,
+                persist: true
+            )
+
+            Self.updatePendingPushPaymentFlag(shared, reconnectSucceeded: true)
+            refreshBalances()
+            updateStableBalances()
+
+            AuditService.log("PUSH_PENDING_PAYMENT_RECONNECT_OK", data: [
+                "node_running": "\(nodeService.isRunning)"
+            ])
+        } catch {
+            Self.updatePendingPushPaymentFlag(shared, reconnectSucceeded: false)
+            AuditService.log("PUSH_PENDING_PAYMENT_RECONNECT_FAILED", data: [
+                "error": error.localizedDescription,
+                "node_running": "\(nodeService.isRunning)"
+            ])
+        }
+    }
+
+    static func updatePendingPushPaymentFlag(_ shared: UserDefaults?, reconnectSucceeded: Bool) {
+        if reconnectSucceeded {
+            // Clear pending marker only after successful reconnect attempt
+            shared?.set(false, forKey: "pending_push_payment")
+        } else {
+            // Keep marker set so foreground or startup can retry
+            shared?.set(true, forKey: "pending_push_payment")
+        }
     }
 
     // MARK: - Push Notification Handling
@@ -588,7 +623,7 @@ class AppState {
             self.updateStableBalances()
 
             AuditService.log("PUSH_WAKE", data: [
-                "node_running": "\(self.nodeService.isRunning)",
+                "node_running": "\(self.nodeService.isRunning)"
             ])
         }
     }
@@ -623,7 +658,7 @@ class AppState {
                 "channel_id": channelId,
                 "user_channel_id": userChannelId,
                 "counterparty": counterpartyNodeId,
-                "funding_txo": "\(fundingTxo)",
+                "funding_txo": "\(fundingTxo)"
             ])
 
         case .channelReady(let channelId, let userChannelId, _, _):
@@ -644,7 +679,7 @@ class AppState {
                     AuditService.log("SPLICE_OUT_STABLE_DEDUCTED", data: [
                         "usd_deducted": "\(usdDeducted)",
                         "new_expected_usd": "\(stableChannel.expectedUSD.amount)",
-                        "btc_price": "\(price)",
+                        "btc_price": "\(price)"
                     ])
                 }
             }
@@ -653,7 +688,7 @@ class AppState {
 
             AuditService.log("CHANNEL_READY", data: [
                 "channel_id": channelId,
-                "user_channel_id": userChannelId,
+                "user_channel_id": userChannelId
             ])
             statusMessage = "Channel is ready"
 
@@ -683,7 +718,7 @@ class AppState {
                     "payment_hash": paymentHash.map { "\($0)" } ?? "nil",
                     "action": trade.action,
                     "new_expected_usd": "\(trade.newExpectedUSD)",
-                    "reason": reason.map { "\($0)" } ?? "unknown",
+                    "reason": reason.map { "\($0)" } ?? "unknown"
                 ])
             } else {
                 // Update payment status in DB
@@ -695,7 +730,7 @@ class AppState {
                 AuditService.log("PAYMENT_FAILED", data: [
                     "payment_id": paymentId.map { "\($0)" } ?? "nil",
                     "payment_hash": paymentHash.map { "\($0)" } ?? "nil",
-                    "reason": reason.map { "\($0)" } ?? "unknown",
+                    "reason": reason.map { "\($0)" } ?? "unknown"
                 ])
                 let reasonStr = reason.map { "\($0)" } ?? "unknown"
                 statusMessage = "Payment failed: \(reasonStr)"
@@ -716,7 +751,7 @@ class AppState {
 
             AuditService.log("SPLICE_FAILED", data: [
                 "channel_id": "\(channelId)",
-                "user_channel_id": "\(userChannelId)",
+                "user_channel_id": "\(userChannelId)"
             ])
             statusMessage = "Splice failed"
 
@@ -754,7 +789,7 @@ class AppState {
         AuditService.log("PAYMENT_RECEIVED", data: [
             "amount_msat": "\(amountMsat)",
             "payment_id": paymentIdStr,
-            "payment_hash": paymentHashStr,
+            "payment_hash": paymentHashStr
         ])
 
         // Record in DB (dedup by paymentIdStr)
@@ -818,7 +853,7 @@ class AppState {
                 "old_expected_usd": "\(oldExpected)",
                 "new_expected_usd": "\(parsed.expectedUSD)",
                 "btc_price": "\(price)",
-                "payment_hash": paymentHash,
+                "payment_hash": paymentHash
             ])
             return true
         }
@@ -850,7 +885,7 @@ class AppState {
                 "payment_hash": paymentHashStr,
                 "action": trade.action,
                 "new_expected_usd": "\(trade.newExpectedUSD)",
-                "fee_paid_msat": feePaidMsat.map { "\($0)" } ?? "nil",
+                "fee_paid_msat": feePaidMsat.map { "\($0)" } ?? "nil"
             ])
 
             refreshBalances()
@@ -884,7 +919,7 @@ class AppState {
                 "usd_deducted": "\(usdDeducted)",
                 "old_expected_usd": "\(oldExpected)",
                 "new_expected_usd": "\(stableChannel.expectedUSD.amount)",
-                "btc_price": "\(price)",
+                "btc_price": "\(price)"
             ])
         }
 
@@ -901,7 +936,7 @@ class AppState {
 
         AuditService.log("PAYMENT_SUCCESSFUL", data: [
             "payment_hash": paymentHashStr,
-            "fee_paid_msat": feePaidMsat.map { "\($0)" } ?? "nil",
+            "fee_paid_msat": feePaidMsat.map { "\($0)" } ?? "nil"
         ])
         statusMessage = "Payment confirmed"
     }
@@ -924,7 +959,7 @@ class AppState {
             "channel_id": "\(channelId)",
             "user_channel_id": "\(userChannelId)",
             "reason": reasonStr,
-            "balance_sats": "\(balanceSats)",
+            "balance_sats": "\(balanceSats)"
         ])
 
         // Record in payment history — use funding txid as the close tx reference
@@ -954,9 +989,12 @@ class AppState {
             stableChannel.userChannelId = ""
         }
 
-        // Refresh balances so lightning drops to 0 immediately
+        // Refresh balances — keep isChannelClosing true until lightning balance
+        // fully resolves to avoid double-counting with on-chain balance.
         refreshBalances()
-        isChannelClosing = false
+        if lightningBalanceSats == 0 {
+            isChannelClosing = false
+        }
         statusMessage = "Channel closed"
     }
 
@@ -972,7 +1010,7 @@ class AppState {
         AuditService.log("SPLICE_PENDING", data: [
             "channel_id": "\(channelId)",
             "user_channel_id": "\(userChannelId)",
-            "funding_txo": "\(newFundingTxo)",
+            "funding_txo": "\(newFundingTxo)"
         ])
 
         // Record/update splice payment
@@ -1016,14 +1054,14 @@ class AppState {
                 try? await Task.sleep(nanoseconds: Constants.stabilityCheckIntervalSecs * 1_000_000_000)
                 guard !Task.isCancelled else { break }
 
+                // Heartbeat — thread-safe, no need to block main thread
+                UserDefaults(suiteName: Constants.appGroupIdentifier)?
+                    .set(Date().timeIntervalSince1970, forKey: "main_app_last_active")
+
+                // ensureLSPConnected can call node.connect() (TCP handshake) — keep off main thread
+                Task.detached { [weak self] in self?.ensureLSPConnected() }
+
                 await MainActor.run { [weak self] in
-                    // Heartbeat so NSE knows main app is active
-                    UserDefaults(suiteName: Constants.appGroupIdentifier)?
-                        .set(Date().timeIntervalSince1970, forKey: "main_app_last_active")
-
-                    // Reconnect to LSP if peer dropped — keeps channel usable
-                    self?.ensureLSPConnected()
-
                     self?.recordCurrentPrice()
                     self?.runStabilityCheck()
                     self?.detectOnchainDeposit()
@@ -1035,7 +1073,7 @@ class AppState {
     func ensureLSPConnected() {
         guard let node = nodeService.node else { return }
         nodeService.refreshChannels()
-        let allUsable = !nodeService.channels.isEmpty && nodeService.channels.allSatisfy { $0.isUsable }
+        let allUsable = !nodeService.channels.isEmpty && nodeService.channels.allSatisfy(\.isUsable)
         guard !allUsable else { return }
         try? node.connect(
             nodeId: Constants.defaultLSPPubkey,
@@ -1077,9 +1115,13 @@ class AppState {
             stableChannel.lastStabilityPayment = now
             stableChannel.paymentMade = true
 
-            // Do NOT reset backingSats here — sendKeysend returning Ok only means
-            // LDK accepted the payment, not that it was delivered.
-            // Next stability check (after cooldown) will detect remaining drift.
+            // Reset backingSats to equilibrium — accounts payment against stable pool.
+            // Don't recompute nativeSats — receiver balance hasn't updated yet (HTLC in flight).
+            // Native will be recomputed on next balance refresh.
+            if price > 0 {
+                stableChannel
+                    .backingSats = UInt64(stableChannel.expectedUSD.amount / price * Double(Constants.satsInBTC))
+            }
             saveChannelToDB()
 
             // Record as pending payment
@@ -1098,11 +1140,11 @@ class AppState {
                 "amount_msat": "\(amountMsat)",
                 "dollars_from_par": "\(result.dollarsFromPar)",
                 "percent_from_par": "\(result.percentFromPar)",
-                "btc_price": "\(price)",
+                "btc_price": "\(price)"
             ])
         } catch {
             AuditService.log("STABILITY_PAYMENT_FAILED", data: [
-                "error": error.localizedDescription,
+                "error": error.localizedDescription
             ])
         }
     }
@@ -1110,9 +1152,8 @@ class AppState {
     // MARK: - On-Chain Deposit Detection
 
     private func detectOnchainDeposit() {
-        // Use totalOnchainBalanceSats consistently (not spendable, which excludes unconfirmed)
-        guard let balances = nodeService.balances() else { return }
-        let currentOnchain = balances.totalOnchainBalanceSats
+        // Use already-updated onchainBalanceSats — refreshBalances() was just called before this
+        let currentOnchain = onchainBalanceSats
 
         if currentOnchain > prevOnchainSats && !isSweeping && pendingSplice == nil {
             let depositSats = currentOnchain - prevOnchainSats
@@ -1140,7 +1181,7 @@ class AppState {
             AuditService.log("ONCHAIN_DEPOSIT_DETECTED", data: [
                 "amount_sats": "\(depositSats)",
                 "prev_onchain": "\(prevOnchainSats)",
-                "new_onchain": "\(currentOnchain)",
+                "new_onchain": "\(currentOnchain)"
             ])
         }
         prevOnchainSats = currentOnchain
@@ -1234,12 +1275,12 @@ class AppState {
 
             AuditService.log("SWEEP_TO_CHANNEL", data: [
                 "amount_sats": "\(sweepAmount)",
-                "fee_rate_sat_vb": "\(feeRateSatVb)",
+                "fee_rate_sat_vb": "\(feeRateSatVb)"
             ])
         } catch {
             statusMessage = "Sweep failed: \(error.localizedDescription)"
             AuditService.log("SWEEP_FAILED", data: [
-                "error": error.localizedDescription,
+                "error": error.localizedDescription
             ])
         }
     }
@@ -1269,7 +1310,7 @@ class AppState {
         } catch {}
         AuditService.log("CHAIN_SOURCE_FALLBACK", data: [
             "primary": Constants.primaryChainURL,
-            "using": Constants.fallbackChainURL,
+            "using": Constants.fallbackChainURL
         ])
         return Constants.fallbackChainURL
     }
@@ -1284,6 +1325,13 @@ class AppState {
 
         lightningBalanceSats = lightning
         onchainBalanceSats = onchain
+        hasReadyChannel = nodeService.channels.contains { $0.isChannelReady }
+        spendableOnchainSats = balances.spendableOnchainBalanceSats
+
+        // Clear closing flag once lightning balance fully resolves
+        if isChannelClosing && lightning == 0 {
+            isChannelClosing = false
+        }
 
         // Cache for instant display on next launch
         let ud = UserDefaults(suiteName: Constants.appGroupIdentifier)
@@ -1342,7 +1390,10 @@ class AppState {
                 // Restore cached balances so UI shows immediately
                 if record.receiverSats > 0 {
                     stableChannel.stableReceiverBTC = Bitcoin(sats: record.receiverSats)
-                    stableChannel.stableReceiverUSD = USD.fromBitcoin(stableChannel.stableReceiverBTC, price: record.latestPrice)
+                    stableChannel.stableReceiverUSD = USD.fromBitcoin(
+                        stableChannel.stableReceiverBTC,
+                        price: record.latestPrice
+                    )
                     StabilityService.recomputeNative(&stableChannel)
                 }
                 if record.latestPrice > 0 {
